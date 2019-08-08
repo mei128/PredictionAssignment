@@ -1,0 +1,292 @@
+---
+title: "Prediction Assignment"
+subtitle: "A Coursera JHU Data Science Specialization Class Project"
+author: "Manuel Esteban-Infantes"
+output:
+  html_document:
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document is a project for peer review as part of the Machine Learning course, within the JHU Data Science Specialization program. The goal is to predict the manner in which a group of individuals perform certain exercise, from data captured by wearable sensors.
+  
+It has been generated with Knitr within RStudio. For readability purposes, all code is executed before hand in an embedded R block with the options >eval = TRUE, echo = FALSE, message = FALSE. All source code is included as an appendix, and the source Rmd file with ther embedded code is [avaible in gitHub](https://github.com/mei128/PredictionAssignment).
+  
+Packages used include caret, gbm, and randomForest.
+
+```{r eval = TRUE, echo = FALSE, message = FALSE, cache = TRUE}
+library(caret)
+library(gbm)
+library(ggplot2)
+library(randomForest)
+```
+
+## Getting and Cleaning Data
+
+Data is obtained from the provided sources (see credits). A first look at data shows a large number of empty, #DIV/0, and NA values. All variables with a large number of NAs are statistic summaries of sensor data (avg, max, min, ammplitude, var, stddev, kurtosis). The high percentage of NAs in those variables (over 97%) does not make them suitable predictors, and are dropped from both sets.
+
+The dataset still contains variables with no predictive value, descriptive of the context but not of the activity being performed, like the index, subject id, the new window flag, or the timestamps. These six variables are removed from both datasets.
+
+```{r message = FALSE, cache = TRUE}
+# Load data
+
+baseURL      <- "https://d396qusza40orc.cloudfront.net/predmachlearn/"
+trainingFile <- "pml-training.csv"
+testingFile  <- "pml-testing.csv"
+
+sourceData <- function(fname) {
+    fpath <- paste0("./data/",fname)
+    furl  <- paste0(baseURL,fname)
+    if (!file.exists("./data"))  { dir.create("./data") }
+    if (!file.exists(fpath))     { download.file(furl, fpath, method = "curl") }
+    read.csv(fpath,na.strings = c("","NA","#DIV/0!"))
+}
+
+trainingSet <- sourceData(trainingFile)
+testingSet  <- sourceData(testingFile)
+
+# Drop majority NAs
+allNA    <- apply(trainingSet,2,function(x) sum(is.na(x)))
+allNA    <- allNA > 0.97*length(trainingSet$X)
+allNA[1] <- TRUE # Patch X out
+trainingSet <- trainingSet[,!allNA]
+testingSet  <- testingSet[,!allNA]
+
+# Drop variables with no predcitive value
+noPred<-which(names(trainingSet) %in% c("X","user_name","raw_timestamp_part_1",
+                                        "raw_timestamp_part_2","cvtd_timestamp","new_window"))
+trainingSet <- trainingSet[,-noPred]
+testingSet  <- testingSet[,-noPred]
+```
+
+The outcome variable, classe, appears sorted along the index, what creates the false impression of some structure in data when plotting some variables colored by outcome (coloring takes place in an ordered manner). To avoid this artifact the dataset is reshuffled (this is not necessary in the testing set).
+
+The training dataset is too large, what lead to non-readable plots and long computing times, so the set has been subsampled, and all exploration has been done with a sample of size 10% of the original training set, within this pre-training set we used 80% of the observations for training and 20% for validation. Final training an validation was performed with the full training set.
+
+```{r message = FALSE, cache = TRUE}
+set.seed(12358)
+
+# Reshuflle data set
+trainingSet <- trainingSet[sample(length(trainingSet$classe)),]
+# Pre-train subset
+inSubSet    <- createDataPartition(trainingSet$classe, p = 0.1, list=FALSE)
+subSet      <- trainingSet[inSubSet,]
+inPreTrain  <- createDataPartition(subSet$classe, p=0.8, list=FALSE)
+preTrainSet <- subSet[ inPreTrain,]
+preTestSet  <- subSet[-inPreTrain,]
+```
+
+## Exploratory Data Analysis
+
+Variables include position (roll, pitch, and yaw) and acceleration (gyros, magnet,accel) for sensors placed in the belt, arm, forearm, and dumbbell. There is some time related information, as in each dumbbell lift, position and acceleration follow a pattern, as shown in the plot for the arm below, but we have to determine the classe -how the activity is being performed- from a single observation, regardless of time sequence.
+
+```{r message = FALSE, cache = TRUE, fig.align = 'center'}
+q1 <- qplot(roll_arm,data=trainingSet,geom="density", col=classe)
+q2 <- qplot(pitch_arm,data=trainingSet,geom="density", col=classe)
+q3 <- qplot(yaw_arm,data=trainingSet,geom="density", col=classe)
+q4 <- qplot(total_accel_arm,data=trainingSet,geom="density", col=classe)
+grid.arrange(q1, q2, q3, q4, nrow=2, ncol=2)
+```
+
+Even after trimming the set, the number of predictors is still too large to try to identify a pattern by direct observation. Plotting pairs of related variables (i.e. below, roll of different parts, different positions of forearm, or different accelerations of dumbbell along Z axis) we could see there some structure too complex to interpret, but enough to feed to a machine learning algorithm. 
+
+```{r message = FALSE, cache = TRUE, fig.align = 'center', fig.height = 3}
+smpset <- sample(length(trainingSet$classe),1000)
+edaset <- grep("roll_",names(trainingSet))
+f1 <- featurePlot(x=trainingSet[smpset,edaset],y=trainingSet$classe[smpset],plot="pairs")
+edaset <- grep("_forearm$",names(trainingSet))
+f2 <- featurePlot(x=trainingSet[smpset,edaset],y=trainingSet$classe[smpset],plot="pairs")
+edaset <- grep("_dumbbell_z",names(trainingSet))
+f3 <- featurePlot(x=trainingSet[smpset,edaset],y=trainingSet$classe[smpset],plot="pairs")
+grid.arrange(f1, f2, f3, nrow=1, ncol=3)
+```
+
+## Cross Validation
+
+Cross validation was performed using caret's built-in repeated cross validation, with 3 repetitions of 10 k-folds. A larger number of repetitions did not increase the accuracy. In order to improve performance and reduce the risk of overfitting, we identified the number of random predictors to be included in the random forests mehod that yielded the least error using the function rfcv from the randomForest package.
+```{r message = FALSE, cache = TRUE, fig.align = 'center', out.width = '80%', fig.asp = 0.62}
+resultCV <- rfcv(preTrainSet[,-54],preTrainSet$classe)
+with(resultCV, plot(n.var, error.cv, log="x", type="o", lwd=2))
+mtry     <- resultCV$n.var[which.min(resultCV$error.cv)]
+tgrid    <- expand.grid(.mtry = mtry)
+control  <- trainControl(method="repeatedcv", number=10, repeats=3)
+```
+The number of variables used is `r mtry`.
+
+## Method selection
+
+Two models were trained using boosting (gbm) and random forests (rf) with the reduced training and validation sets.
+
+```{r message = FALSE, cache = TRUE}
+modelRF  <- train(classe~., data=preTrainSet, method="rf",
+                metric = "Accuracy", trControl = control, tuneGrid = tgrid, prox = TRUE)
+predRF   <- predict(modelRF, preTestSet)
+
+modelGBM <- train(classe~., data=preTrainSet, method="gbm",
+                metric = "Accuracy", trControl = control, verbose = FALSE)
+predGBM  <- predict(modelGBM,preTestSet)
+
+comparison <- resamples(list(RF=modelRF,BOOSTING=modelGBM))
+summary(comparison)
+```
+
+Random forests showed better mean and median accuracies, with boosting showing maximum better accuracy, but we look for better accuracy all over the set, hence we settled for random forests to train the final model.
+
+## Final training and prediction
+
+The training set was split using 80% to train the final model and 20% for validation and estimation of the out of sample error, and a model was produced using random forests method with the same tuning as before.
+
+```{r message = FALSE, cache = TRUE}
+# Training  - final
+
+inFinal    <- createDataPartition(trainingSet$classe, p = 0.8, list=FALSE)
+trainFinal <- trainingSet[ inFinal,]
+ testFinal <- trainingSet[-inFinal,]
+
+model      <- train(classe~., data=trainFinal, method="rf",
+                   metric = "Accuracy", trControl = control, tuneGrid = tgrid, prox = TRUE)
+
+model$finalModel
+```
+The **trained model has an OOB (out of the bag) error of 0.19%** (accuracy 99.8%)
+```{r message = FALSE, cache = TRUE}
+validation <- predict(model,testFinal)
+
+insample   <- confusionMatrix(validation,testFinal$classe)
+
+insample$overall
+```
+However, With the validation set, **the accuracy was 99.87%**.
+
+We finally applied the trained model to the provided testing set, obtaining the followind results:
+```{r message = FALSE, cache = TRUE}
+# Prediction - final
+
+prediction <- predict(model, testingSet)
+resultset  <- data.frame(problem_id=testingSet$problem_id, classe = prediction)
+print(resultset)
+```
+
+
+### Credits
+
+Data for this exercise was sourced from:
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.
+
+\newpage
+# Annex I - Source Code
+
+This section includes the source code embedded in the document in a single block.
+
+```{r eval = FALSE}
+library(caret)
+library(gbm)
+library(ggplot2)
+library(randomForest)
+
+# Load data
+
+baseURL      <- "https://d396qusza40orc.cloudfront.net/predmachlearn/"
+trainingFile <- "pml-training.csv"
+testingFile  <- "pml-testing.csv"
+
+sourceData <- function(fname) {
+    fpath <- paste0("./data/",fname)
+    furl  <- paste0(baseURL,fname)
+    if (!file.exists("./data"))  { dir.create("./data") }
+    if (!file.exists(fpath))     { download.file(furl, fpath, method = "curl") }
+    read.csv(fpath,na.strings = c("","NA","#DIV/0!"))
+}
+
+trainingSet <- sourceData(trainingFile)
+testingSet  <- sourceData(testingFile)
+
+# Drop majority NAs
+allNA    <- apply(trainingSet,2,function(x) sum(is.na(x)))
+allNA    <- allNA > 0.97*length(trainingSet$X)
+allNA[1] <- TRUE # Patch X out
+trainingSet <- trainingSet[,!allNA]
+testingSet  <- testingSet[,!allNA]
+
+# Drop variables with no predcitive value
+noPred<-which(names(trainingSet) %in% c("X","user_name","raw_timestamp_part_1","raw_timestamp_part_2","cvtd_timestamp","new_window"))
+trainingSet <- trainingSet[,-noPred]
+testingSet  <- testingSet[,-noPred]
+
+set.seed(12358)
+
+# Reshuflle data set
+trainingSet <- trainingSet[sample(length(trainingSet$classe)),]
+
+
+# Pre-train subset
+
+inSubSet    <- createDataPartition(trainingSet$classe, p = 0.1, list=FALSE)
+subSet      <- trainingSet[inSubSet,]
+inPreTrain  <- createDataPartition(subSet$classe, p=0.8, list=FALSE)
+preTrainSet <- subSet[ inPreTrain,]
+preTestSet  <- subSet[-inPreTrain,]
+
+# Exploration
+
+q1 <- qplot(roll_arm,data=trainingSet,geom="density", col=classe)
+q2 <- qplot(pitch_arm,data=trainingSet,geom="density", col=classe)
+q3 <- qplot(yaw_arm,data=trainingSet,geom="density", col=classe)
+q4 <- qplot(total_accel_arm,data=trainingSet,geom="density", col=classe)
+grid.arrange(q1, q2, q3, q4, nrow=2, ncol=2)
+
+smpset <- sample(length(trainingSet$classe),1000)
+edaset <- grep("roll_",names(trainingSet))
+f1 <- featurePlot(x=trainingSet[smpset,edaset],y=trainingSet$classe[smpset],plot="pairs")
+edaset <- grep("_forearm$",names(trainingSet))
+f2 <- featurePlot(x=trainingSet[smpset,edaset],y=trainingSet$classe[smpset],plot="pairs")
+edaset <- grep("_dumbbell_z",names(trainingSet))
+f3 <- featurePlot(x=trainingSet[smpset,edaset],y=trainingSet$classe[smpset],plot="pairs")
+grid.arrange(f1, f2, f3, nrow=1, ncol=3)
+
+# Cross validation set-up: determine best mtry
+
+resultCV <- rfcv(preTrainSet[,-54],preTrainSet$classe)
+with(resultCV, plot(n.var, error.cv, log="x", type="o", lwd=2))
+mtry     <- resultCV$n.var[which.min(resultCV$error.cv)]
+tgrid    <- expand.grid(.mtry = mtry)
+control  <- trainControl(method="repeatedcv", number=10, repeats=3)
+
+# Training subset
+
+modelRF  <- train(classe~., data=preTrainSet, method="rf",
+                metric = "Accuracy", trControl = control, tuneGrid = tgrid, prox = TRUE)
+predRF   <- predict(modelRF, preTestSet)
+
+modelGBM <- train(classe~., data=preTrainSet, method="gbm",
+                metric = "Accuracy", trControl = control, verbose = FALSE)
+predGBM  <- predict(modelGBM,preTestSet)
+
+comparison <- resamples(list(RF=modelRF,BOOSTING=modelGBM))
+summary(comparison)
+
+# Training  - final
+
+inFinal    <- createDataPartition(trainingSet$classe, p = 0.8, list=FALSE)
+trainFinal <- trainingSet[ inFinal,]
+ testFinal <- trainingSet[-inFinal,]
+
+model      <- train(classe~., data=trainFinal, method="rf",
+                    metric = "Accuracy", trControl = control, tuneGrid = tgrid, prox = TRUE)
+validation <- predict(model,testFinal)
+
+insample   <- confusionMatrix(validation,testFinal$classe)
+
+insample$overall
+
+# Prediction - final
+
+prediction <- predict(model, testingSet)
+resultset  <- data.frame(problem_id=testingSet$problem_id, classe = prediction)
+print(resultset)
+```
+
